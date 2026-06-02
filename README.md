@@ -1,3 +1,5 @@
+If you want to support me: "https://www.patreon.com/cw/Hitakumori"
+
 🎮 How to Use
 Download: Place Mod_Cycler_v6.5.exe anywhere you want. The app is portable; settings are stored in %APPDATA%\NRMM_Mod_Cycler.
 
