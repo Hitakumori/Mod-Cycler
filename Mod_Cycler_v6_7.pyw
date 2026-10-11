@@ -9,18 +9,13 @@ from ctypes import wintypes
 from datetime import datetime
 import json
 import hashlib
+import queue
 import tempfile
-import subprocess
-import urllib.error
-import urllib.parse
-import urllib.request
 import webbrowser
 import tkinter as tk
-from tkinter import messagebox, ttk, filedialog, simpledialog, colorchooser
+from tkinter import messagebox, ttk, filedialog, simpledialog
 import pystray
-from PIL import Image, ImageDraw
-
-askcolor = colorchooser.askcolor
+from PIL import Image, ImageDraw, ImageTk
 
 # PATH RESOLUTION
 if getattr(sys, 'frozen', False):
@@ -31,17 +26,22 @@ else:
 # APPDATA FOR INVISIBLE CONFIG STORAGE
 APP_NAME = "Mod Cycler"
 APP_ID = "ModCycler"
-APP_VERSION = "6.6"
-GITHUB_REPO = "Hitakumori/Mod-Cycler"
-GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
-GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
-GITHUB_LATEST_RELEASE_URL = f"{GITHUB_RELEASES_URL}/latest"
-GITHUB_TAGS_URL = f"https://github.com/{GITHUB_REPO}/tags"
+APP_VERSION = "6.7"
+UI_COLOR = "#007acc"
+UI_BG = "#202022"
+UI_PANEL = "#242426"
+UI_FIELD = "#303136"
+UI_BORDER = "#53545a"
+UI_TEXT = "#f2f2f3"
+UI_MUTED = "#a7a8af"
 SUPPORT_URL = "https://www.patreon.com/cw/Hitakumori"
-INSTANCE_HASH = hashlib.sha1(os.path.normcase(BASE).encode("utf-8")).hexdigest()[:16]
-INSTANCE_NAME = f"Local\\{APP_ID}_{INSTANCE_HASH}"
 APPDATA_DIR = os.path.join(os.getenv('APPDATA') or os.path.expanduser("~"), "NRMM_Mod_Cycler")
 CONFIG_FILE = os.path.join(APPDATA_DIR, "config.json")
+INSTANCE_HASH = hashlib.sha1(os.path.normcase(os.path.abspath(CONFIG_FILE)).encode("utf-8")).hexdigest()[:16]
+INSTANCE_NAME = f"Local\\{APP_ID}_{INSTANCE_HASH}"
+HOTKEY_MODIFIERS = 0x4001  # MOD_ALT | MOD_NOREPEAT
+HOTKEY_VK = 0x53  # S
+DEFAULT_KEYS = {"next": "PGUP", "prev": "PGDN", "shuffle": "INSERT", "auto": "CAPSLOCK", "auto_shuf": "END"}
 CYCLER_DIR_NAME = "Mod Cycler"
 ACTIVE_INI_NAME = "mod_cycler.ini"
 PROFILES_DIR_NAME = "Profiles"
@@ -74,14 +74,76 @@ MANAGED_SLOT_ID_PATTERN = re.compile(
 )
 
 
+def read_json_object(path):
+    with open(path, "r", encoding="utf-8-sig") as source:
+        data = json.load(source)
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object.")
+    return data
+
+
+def write_json_atomic(path, data):
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False) as output:
+            temporary_path = output.name
+            json.dump(data, output, indent=2, allow_nan=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError as error:
+                print(f"[Mod Cycler] Could not remove temporary JSON file: {error}")
+
+
+def parse_group_id(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    return None
+
+
+def clean_keybind(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return value if value and not any(ord(char) < 32 or ord(char) == 127 for char in value) else ""
+
+
+def clean_nicknames(values):
+    if not isinstance(values, dict):
+        return {}
+    return {str(parse_group_id(gid)): name.strip() for gid, name in values.items()
+            if parse_group_id(gid) is not None and isinstance(name, str) and name.strip()}
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def find_child_dir(parent, names):
     if not parent or not os.path.isdir(parent):
         return ""
     wanted = {name.casefold() for name in names}
     try:
-        for entry in os.scandir(parent):
-            if entry.is_dir() and entry.name.casefold() in wanted:
-                return os.path.normpath(entry.path)
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                if entry.is_dir() and entry.name.casefold() in wanted:
+                    return os.path.normpath(entry.path)
     except OSError:
         return ""
     return ""
@@ -167,163 +229,6 @@ def find_managed_slot_id(mod_path):
     return None
 
 
-class UpdateError(Exception):
-    pass
-
-
-def parse_version(value):
-    match = re.search(r"(\d+(?:\.\d+){0,3})", str(value or ""))
-    if not match:
-        return ()
-    parts = [int(part) for part in match.group(1).split(".")]
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts)
-
-
-def compare_versions(left, right):
-    left_parts = parse_version(left)
-    right_parts = parse_version(right)
-    if not left_parts or not right_parts:
-        return 0
-    return (left_parts > right_parts) - (left_parts < right_parts)
-
-
-def fetch_github_json(path_or_url):
-    url = path_or_url if path_or_url.startswith("http") else f"{GITHUB_API_BASE}{path_or_url}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"{APP_ID}/{APP_VERSION}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=12) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def pick_release_asset(release_data):
-    exe_assets = []
-    fallback_assets = []
-    for asset in release_data.get("assets", []):
-        name = asset.get("name", "")
-        download_url = asset.get("browser_download_url")
-        if not download_url:
-            continue
-        lower_name = name.lower()
-        if lower_name.endswith(".exe"):
-            exe_assets.append((name, download_url))
-        elif lower_name.endswith((".zip", ".7z")):
-            fallback_assets.append((name, download_url))
-
-    preferred_exes = [
-        asset for asset in exe_assets
-        if "mod" in asset[0].lower() and "cycler" in asset[0].lower()
-    ]
-    if preferred_exes:
-        return preferred_exes[0][0], preferred_exes[0][1], True
-    if exe_assets:
-        return exe_assets[0][0], exe_assets[0][1], True
-    if fallback_assets:
-        return fallback_assets[0][0], fallback_assets[0][1], False
-    return "", "", False
-
-
-def get_latest_update_info():
-    try:
-        release = fetch_github_json("/releases/latest")
-        asset_name, asset_url, installable = pick_release_asset(release)
-        version = release.get("tag_name") or release.get("name")
-        if not version:
-            raise UpdateError("Latest GitHub release does not have a version tag.")
-        return {
-            "source": "release",
-            "version": version,
-            "title": release.get("name") or version,
-            "url": release.get("html_url") or GITHUB_LATEST_RELEASE_URL,
-            "asset_name": asset_name,
-            "asset_url": asset_url,
-            "installable": installable,
-        }
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise UpdateError(f"GitHub release check failed: HTTP {e.code}") from e
-
-    try:
-        tags = fetch_github_json("/tags")
-    except urllib.error.HTTPError as e:
-        raise UpdateError(f"GitHub update check failed: HTTP {e.code}") from e
-
-    if not tags:
-        raise UpdateError("No GitHub releases or tags were found.")
-
-    tag = tags[0]
-    version = tag.get("name")
-    if not version:
-        raise UpdateError("Latest GitHub tag does not have a version name.")
-    return {
-        "source": "tag",
-        "version": version,
-        "title": version,
-        "url": GITHUB_TAGS_URL,
-        "asset_name": "",
-        "asset_url": "",
-        "installable": False,
-    }
-
-
-def download_update_asset(asset_url, asset_name):
-    parsed_name = os.path.basename(urllib.parse.urlparse(asset_url).path)
-    file_name = asset_name or urllib.parse.unquote(parsed_name) or "Mod_Cycler_update.exe"
-    if not file_name.lower().endswith(".exe"):
-        raise UpdateError("The latest release asset is not a Windows executable.")
-
-    update_dir = tempfile.mkdtemp(prefix="ModCyclerUpdate_")
-    download_path = os.path.join(update_dir, file_name)
-    request = urllib.request.Request(
-        asset_url,
-        headers={"User-Agent": f"{APP_ID}/{APP_VERSION}"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response, open(download_path, "wb") as output:
-        while True:
-            chunk = response.read(1024 * 256)
-            if not chunk:
-                break
-            output.write(chunk)
-
-    if os.path.getsize(download_path) < 1024 * 1024:
-        raise UpdateError("Downloaded update is too small to be a valid app executable.")
-    with open(download_path, "rb") as f:
-        if f.read(2) != b"MZ":
-            raise UpdateError("Downloaded update is not a Windows executable.")
-    return download_path
-
-
-def write_updater_script(download_path, destination_path, pid):
-    script_path = os.path.join(os.path.dirname(download_path), "apply_mod_cycler_update.bat")
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write("@echo off\n")
-        f.write("setlocal\n")
-        f.write(f"set \"SRC={download_path}\"\n")
-        f.write(f"set \"DST={destination_path}\"\n")
-        f.write(f"set \"PID={pid}\"\n")
-        f.write(":wait\n")
-        f.write("tasklist /FI \"PID eq %PID%\" | find \"%PID%\" >nul\n")
-        f.write("if not errorlevel 1 (\n")
-        f.write("    timeout /t 1 /nobreak >nul\n")
-        f.write("    goto wait\n")
-        f.write(")\n")
-        f.write("copy /Y \"%SRC%\" \"%DST%\" >nul\n")
-        f.write("if errorlevel 1 (\n")
-        f.write(f"    start \"\" \"{GITHUB_RELEASES_URL}\"\n")
-        f.write("    exit /b 1\n")
-        f.write(")\n")
-        f.write("start \"\" \"%DST%\"\n")
-        f.write("exit /b 0\n")
-    return script_path
-
-
 # --- SINGLE INSTANCE CHECK ---
 def focus_existing_window():
     """Best-effort restore/focus for the already-running app window."""
@@ -363,6 +268,8 @@ def check_single_instance():
 
     h_semaphore = kernel32.CreateSemaphoreW(None, 1, 1, INSTANCE_NAME)
     last_error = kernel32.GetLastError()
+    if not h_semaphore:
+        raise ctypes.WinError(last_error)
 
     if last_error == 183:  # ERROR_ALREADY_EXISTS
         focus_existing_window()
@@ -391,32 +298,47 @@ class GeneratorApp:
         self.semaphore_handle = semaphore_handle or check_single_instance()
 
         self.root.title(APP_NAME)
-        self.root.geometry("380x780+150+150")
+        self.ui_scale = min(max(1.0, self.root.winfo_fpixels("1i") / 96.0),
+                            max(0.7, (self.root.winfo_screenheight() - 80) / 1000))
+        self.minimum_size = (self.ui_pixels(620), self.ui_pixels(850))
+        self.root.minsize(*self.minimum_size)
+        width = self.ui_pixels(680)
+        height = min(self.ui_pixels(1000), self.root.winfo_screenheight() - 80)
+        x = min(100, max(0, (self.root.winfo_screenwidth() - width) // 2))
+        self.root.geometry(f"{width}x{height}+{x}+40")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#1e1e1e")
+        self.root.configure(bg=UI_BG)
 
         self.is_visible = True
+        self._closing = False
+        self._ui_thread_id = threading.get_ident()
+        self._ui_actions = queue.Queue()
+        self._hotkey_stop = threading.Event()
+        self._hotkey_thread_id = None
+        self._groups_path_key = None
         self.group_vars = {}
         self.group_widgets = []
         self.group_paths = {}  # gid -> absolute path, populated by refresh_groups
         self.group_slot_counts = {}
         self.group_favorite_slot_counts = {}
         self.group_favorite_slots = {}
+        self.group_mod_names = {}
+        self.group_unresolved_favorites = {}
         self.duplicate_group_paths = []
         self.master_var = tk.BooleanVar(value=True)
 
         # Load Config
         config_data = self.load_config()
         self.target_dir, self.managed_path, self.legacy_managed_path = resolve_mods_folder(config_data["mods_path"])
-        self.ui_alpha = config_data.get("ui_alpha", 0.95)
-        self.ui_color = config_data.get("ui_color", "#007acc")
+        self.ui_color = UI_COLOR
         self.nicknames_by_path = config_data.get("nicknames_by_path", {})
         self.legacy_nicknames = config_data.get("legacy_nicknames", {})
         self.nicknames = {}
+        self.legacy_nickname_key = self.get_path_key()
+        self._nicknames_migrated = False
         self.use_target_nicknames()
 
-        self.root.attributes("-alpha", self.ui_alpha)
 
         self.key_options = [
             "PGUP", "PGDN", "INSERT", "DELETE", "HOME", "END",
@@ -442,293 +364,223 @@ class GeneratorApp:
         }
         self.favorite_only_var = tk.BooleanVar(value=config_data.get("favorite_only", False))
 
-        # --- CUSTOM THEMES ---
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.style.configure("Vertical.TScrollbar", gripcount=0, troughcolor="#252526", bordercolor="#252526", arrowcolor="white")
-        self.style.configure("TCombobox", fieldbackground="#333337", background="#252526", foreground="white", bordercolor="#1e1e1e", arrowcolor="white")
-        self.root.option_add('*TCombobox*Listbox.bg', '#252526')
-        self.root.option_add('*TCombobox*Listbox.fg', 'white')
-
-        # --- DRAGGABLE TITLE BAR ---
-        self.title_bar = tk.Frame(root, bg="#2d2d30", relief="raised", bd=0)
-        self.title_bar.pack(fill="x")
-        self.title_bar.bind("<ButtonPress-1>", self.start_move)
-        self.title_bar.bind("<B1-Motion>", self.do_move)
-
-        self.title_lbl = tk.Label(self.title_bar, text=f" Mod Cycler v{APP_VERSION}", bg="#2d2d30", fg=self.ui_color, font=("Segoe UI", 10, "bold"))
-        self.title_lbl.pack(side="left", pady=6, padx=10)
-
-        self.close_btn = tk.Button(self.title_bar, text="✕", bg="#2d2d30", fg="#cccccc", bd=0, font=("Segoe UI", 10), command=self.hide_window, activeforeground="white")
-        self.close_btn.pack(side="right", padx=(0, 10))
-
-        self.min_btn = tk.Button(self.title_bar, text="—", bg="#2d2d30", fg="#cccccc", bd=0, font=("Segoe UI", 10, "bold"), command=self.hide_window, activeforeground="white")
-        self.min_btn.pack(side="right", padx=5)
-
-        # --- FOOTER SECTION ---
-        footer_frame = tk.Frame(root, bg="#1e1e1e")
-        footer_frame.pack(side="bottom", fill="x", padx=20, pady=(5, 10))
-
-        # FIX 2: Store info_frame as self.info_frame so update_ui_theme can reach it directly.
-        self.info_frame = tk.Frame(footer_frame, bg="#1e1e1e")
-        self.info_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
-        tk.Label(self.info_frame, text="Custom Keybinds:", bg="#1e1e1e", fg="#ffffff", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 5))
-
-        self.create_keybind_row(self.info_frame, 1, "Next Mod:", self.keys["next"], "Prev Mod:", self.keys["prev"])
-        self.create_keybind_row(self.info_frame, 2, "Shuffle:", self.keys["shuffle"], "", None)
-        self.create_keybind_row(self.info_frame, 3, "Auto-Cycle:", self.keys["auto"], "Auto-Shuffle:", self.keys["auto_shuf"])
-
-        self.profile_frame = tk.Frame(footer_frame, bg="#1e1e1e")
-        self.profile_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
-        tk.Label(self.profile_frame, text="Profile:", bg="#1e1e1e", fg="#ffffff", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 5))
-
-        self.profile_var = tk.StringVar()
-        self.profile_combo = ttk.Combobox(self.profile_frame, textvariable=self.profile_var, state="readonly", width=18)
-        self.profile_combo.bind("<<ComboboxSelected>>", self.load_selected_profile)
-        self.profile_combo.grid(row=1, column=0, columnspan=3, sticky="ew", pady=2, padx=(0, 8))
-
-        self.save_profile_btn = tk.Button(self.profile_frame, text="SAVE", bg=self.ui_color, fg="white", bd=0,
-                                          font=("Segoe UI", 8, "bold"), command=self.save_current_profile,
-                                          activeforeground="white")
-        self.save_profile_btn.grid(row=1, column=3, sticky="ew", pady=2, ipady=3)
-
-        settings_frame = tk.Frame(footer_frame, bg="#1e1e1e")
-        settings_frame.grid(row=2, column=0, sticky="nsew")
-
-        tk.Label(settings_frame, text="UI Customization:", bg="#1e1e1e", fg="#ffffff", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 5))
-
-        self.theme_btn = tk.Button(settings_frame, text="Choose UI Color", bg=self.ui_color, fg="white", bd=0, font=("Segoe UI", 8, "bold"), command=self.pick_ui_color)
-        self.theme_btn.grid(row=1, column=0, columnspan=2, pady=2, ipady=3, padx=(0, 10))
-
-        tk.Label(settings_frame, text="UI Transparency:", bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 8)).grid(row=1, column=2, sticky="w", padx=2)
-
-        self.alpha_scale = tk.Scale(settings_frame, from_=0.1, to=1.0, resolution=0.01, orient="horizontal",
-                                    bg="#333337", activebackground=self.ui_color, troughcolor="#1e1e1e",
-                                    highlightthickness=0, bd=0, length=130, showvalue=0,
-                                    command=self.update_alpha_from_scale)
-        self.alpha_scale.set(self.ui_alpha)
-        self.alpha_scale.grid(row=1, column=3, sticky="w", padx=2)
-
-        self.update_btn = tk.Button(settings_frame, text="CHECK UPDATES", bg=self.ui_color, fg="white", bd=0,
-                                    font=("Segoe UI", 8, "bold"), command=self.check_for_updates,
-                                    activeforeground="white")
-        self.update_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0), ipady=3, padx=(0, 10))
-
-        self.support_btn = tk.Button(settings_frame, text="SUPPORT ME", bg=self.ui_color, fg="white", bd=0,
-                                     font=("Segoe UI", 8, "bold"), command=self.open_support_page,
-                                     activeforeground="white")
-        self.support_btn.grid(row=2, column=2, columnspan=2, sticky="ew", pady=(8, 0), ipady=3, padx=(10, 0))
-
-        self.gen_btn = tk.Button(root, text="GENERATE .INI", bg=self.ui_color, fg="white", bd=0, font=("Segoe UI", 10, "bold"), command=self.generate_ini, activeforeground="white")
-        self.gen_btn.pack(side="bottom", fill="x", padx=20, pady=10, ipady=8)
-
-        # --- HEADER SECTION ---
-        top_frame = tk.Frame(root, bg="#1e1e1e")
-        top_frame.pack(side="top", fill="x", padx=20, pady=(15, 5))
-
-        folder_lbl_frame = tk.Frame(top_frame, bg="#1e1e1e")
-        folder_lbl_frame.pack(fill="x", pady=(0, 15))
-        tk.Label(folder_lbl_frame, text="Mods Folder:", bg="#1e1e1e", fg="#ffffff", font=("Segoe UI", 10, "bold")).pack(side="top", anchor="w")
-
-        path_display_frame = tk.Frame(folder_lbl_frame, bg="#1e1e1e")
-        path_display_frame.pack(fill="x", pady=(2, 0))
-
-        self.path_lbl = tk.Label(path_display_frame, text=self.truncate_path(self.target_dir), bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 8))
-        self.path_lbl.pack(side="left", anchor="w")
-
-        self.browse_btn = tk.Button(path_display_frame, text="BROWSE", bg=self.ui_color, fg="white", bd=0, font=("Segoe UI", 8, "bold"), command=self.browse_folder, activeforeground="white", padx=10)
-        self.browse_btn.pack(side="right")
-
-        tk.Label(top_frame, text="Mod Change Interval (Seconds):", bg="#1e1e1e", fg="#ffffff", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
-
-        self.timer_var = tk.StringVar(value="120")
-        entry = tk.Entry(top_frame, textvariable=self.timer_var, width=10, bg="#333337", fg="white", bd=1, insertbackground="white", font=("Segoe UI", 11), justify="center")
-        entry.pack(anchor="w")
-
-        self.favorites_only_cb = tk.Checkbutton(
-            top_frame,
-            text="Favorites only (NRMM fav files)",
-            variable=self.favorite_only_var,
-            command=self.save_config,
-            bg="#1e1e1e",
-            selectcolor="#1e1e1e",
-            activebackground="#1e1e1e",
-            fg="#ffffff",
-            activeforeground="#ffffff",
-            font=("Segoe UI", 9),
-            bd=0,
-        )
-        self.favorites_only_cb.pack(anchor="w", pady=(5, 0))
-
-        self.groups_lbl = tk.Label(root, text="Detected Groups (Right-Click to Rename):", bg="#1e1e1e", fg="#ffffff", font=("Segoe UI", 10, "bold"))
-        self.groups_lbl.pack(side="top", anchor="w", padx=20, pady=(10, 0))
-
-        self.master_cb = tk.Checkbutton(root, text="Select All", variable=self.master_var, command=self.toggle_all,
-                                        bg="#1e1e1e", selectcolor="#1e1e1e", activebackground="#1e1e1e",
-                                        font=("Segoe UI", 9, "bold"), bd=0)
-        self.master_cb.pack(side="top", anchor="w", padx=20, pady=(0, 5))
-
-        list_container = tk.Frame(root, bg="#252526", bd=1, relief="flat")
-        list_container.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-
-        self.canvas = tk.Canvas(list_container, bg="#252526", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=self.canvas.yview, style="Vertical.TScrollbar")
-        self.scroll_frame = tk.Frame(self.canvas, bg="#252526")
-
-        self.canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.canvas.bind("<Configure>", self.on_canvas_resize)
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-        scrollbar.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-
+        self.build_ui()
+        self.start_x = self.start_y = self.start_w = self.start_h = 0
+        self.x = self.y = 0
         self.refresh_groups()
         self.refresh_profile_list()
 
-        self.grip = tk.Canvas(root, width=15, height=15, bg="#1e1e1e", highlightthickness=0, cursor="bottom_right_corner")
-        self.grip.place(relx=1.0, rely=1.0, anchor="se")
-
-        self.start_x = self.start_y = self.start_w = self.start_h = 0
-        self.x = self.y = 0
-        self.current_columns = 1
-
-        self.grip.bind("<ButtonPress-1>", self.start_resize)
-        self.grip.bind("<B1-Motion>", self.do_resize)
-
-        self.update_ui_theme()
-
+        self._ui_poll_id = self.root.after(100, self.process_ui_actions)
         self.setup_tray()
         self.hotkey_thread = threading.Thread(target=self.listen_for_hotkey, daemon=True)
         self.hotkey_thread.start()
+        if self._nicknames_migrated:
+            self.save_config()
 
     # -----------------------------------------------------------------------
 
-    def update_alpha_from_scale(self, value):
-        self.ui_alpha = float(value)
-        self.root.attributes("-alpha", self.ui_alpha)
-        self.save_config()
+    def ui_pixels(self, value):
+        return max(1, round(value * self.ui_scale))
 
-    def pick_ui_color(self):
-        color_tuple = askcolor(color=self.ui_color, title="Select UI Theme Color")
-        if color_tuple[1]:
-            self.ui_color = color_tuple[1]
-            self.update_ui_theme()
-            self.save_config()
-            self.tray_icon.stop()
-            self.setup_tray()
+    def build_ui(self):
+        root = self.root
+        u = self.ui_pixels
+        self.body_font = ("Segoe UI", -u(16))
+        self.small_font = ("Segoe UI", -u(14))
+        self.heading_font = ("Segoe UI", -u(19), "bold")
+        self.checkbox_images = {bg: self.create_checkbox_images(bg) for bg in (UI_BG, UI_PANEL)}
+        self.configure_ui_styles()
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(1, weight=1)
 
-    def set_update_button(self, text="CHECK UPDATES", enabled=True):
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self.update_btn.config(text=text, state=state)
+        # The title and its label both drag; window buttons still hide to tray.
+        self.title_bar = tk.Frame(root, bg=self.ui_color, height=u(42))
+        self.title_bar.grid(row=0, column=0, sticky="ew")
+        self.title_bar.grid_propagate(False)
+        self.title_bar.grid_columnconfigure(0, weight=1)
+        self.title_bar.grid_rowconfigure(0, weight=1)
+        self.title_lbl = tk.Label(self.title_bar, text=f"Mod Cycler v{APP_VERSION}",
+                                  bg=self.ui_color, fg="white", font=("Segoe UI", -u(21)), anchor="w")
+        self.title_lbl.grid(row=0, column=0, sticky="nsew", padx=u(20))
+        for widget in (self.title_bar, self.title_lbl):
+            widget.bind("<ButtonPress-1>", self.start_move)
+            widget.bind("<B1-Motion>", self.do_move)
+        self.min_btn = self.create_ui_button(self.title_bar, "—", self.hide_window)
+        self.min_btn.grid(row=0, column=1, sticky="ns", ipadx=u(9))
+        self.close_btn = self.create_ui_button(self.title_bar, "✕", self.hide_window)
+        self.close_btn.grid(row=0, column=2, sticky="ns", ipadx=u(9))
+        self.close_btn.configure(activebackground="#c42b36")
+
+        self.content_frame = tk.Frame(root, bg=UI_BG)
+        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=u(22), pady=(u(16), u(18)))
+        self.content_frame.grid_columnconfigure(0, weight=1)
+        self.content_frame.grid_rowconfigure(5, weight=1, minsize=u(130))
+
+        folder_frame = tk.Frame(self.content_frame, bg=UI_BG)
+        folder_frame.grid(row=0, column=0, sticky="ew")
+        folder_frame.grid_columnconfigure(0, weight=1)
+        tk.Label(folder_frame, text="Mods Folder", bg=UI_BG, fg=UI_TEXT, font=self.body_font).grid(
+            row=0, column=0, sticky="w", pady=(0, u(8)))
+        path_field = tk.Frame(folder_frame, bg=UI_FIELD, highlightthickness=1, highlightbackground=UI_BORDER)
+        path_field.grid(row=1, column=0, sticky="nsew", padx=(0, u(12)))
+        self.path_lbl = tk.Label(path_field, text=self.truncate_path(self.target_dir),
+                                  bg=UI_FIELD, fg=UI_TEXT, font=self.body_font, anchor="w")
+        self.path_lbl.pack(fill="both", expand=True, padx=u(12), pady=u(8))
+        self.browse_btn = self.create_ui_button(folder_frame, "BROWSE", self.browse_folder)
+        self.browse_btn.grid(row=1, column=1, sticky="nsew", ipadx=u(12))
+
+        cycle_frame = tk.Frame(self.content_frame, bg=UI_BG)
+        cycle_frame.grid(row=1, column=0, sticky="ew", pady=(u(16), u(16)))
+        tk.Label(cycle_frame, text="Interval (seconds)", bg=UI_BG, fg=UI_TEXT, font=self.body_font).grid(
+            row=0, column=0, sticky="w")
+        self.timer_var = tk.StringVar(value="120")
+        self.interval_entry = tk.Entry(cycle_frame, textvariable=self.timer_var, width=6,
+                                       bg=UI_FIELD, fg=UI_TEXT, insertbackground=UI_TEXT,
+                                       font=self.body_font, relief="flat", highlightthickness=1,
+                                       highlightbackground=UI_BORDER, highlightcolor=self.ui_color)
+        self.interval_entry.grid(row=0, column=1, padx=(u(12), u(22)), ipady=u(8))
+        self.favorites_only_cb = self.create_checkbox(
+            cycle_frame, "Favorites only (NRMM fav files)", self.favorite_only_var, self.save_config, UI_BG,
+            font=self.small_font)
+        self.favorites_only_cb.grid(row=0, column=2, sticky="w")
+        self.create_separator(self.content_frame, 2)
+
+        groups_header = tk.Frame(self.content_frame, bg=UI_BG)
+        groups_header.grid(row=3, column=0, sticky="ew", pady=(u(14), u(8)))
+        self.groups_lbl = tk.Label(groups_header, text="Detected Groups", bg=UI_BG, fg=UI_TEXT,
+                                    font=self.heading_font)
+        self.groups_lbl.pack(side="left")
+        tk.Label(groups_header, text="Right-click to rename", bg=UI_BG, fg=UI_MUTED,
+                 font=self.small_font).pack(side="left", padx=u(14))
+        self.master_cb = self.create_checkbox(self.content_frame, "Select All", self.master_var,
+                                              self.toggle_all, UI_BG)
+        self.master_cb.grid(row=4, column=0, sticky="w", pady=(0, u(8)))
+
+        list_container = tk.Frame(self.content_frame, bg=UI_PANEL, highlightthickness=1,
+                                   highlightbackground=UI_BORDER)
+        list_container.grid(row=5, column=0, sticky="nsew")
+        self.canvas = tk.Canvas(list_container, bg=UI_PANEL, highlightthickness=0, yscrollincrement=u(34))
+        self.scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=self.canvas.yview,
+                                        style="Cycler.Vertical.TScrollbar")
+        self.scroll_frame = tk.Frame(self.canvas, bg=UI_PANEL)
+        self.scroll_frame.grid_columnconfigure(0, weight=1)
+        self.groups_window = self.canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
+        self.scroll_frame.bind("<Configure>", lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.create_separator(self.content_frame, 6, pady=(u(16), u(12)))
+        self.info_frame = tk.Frame(self.content_frame, bg=UI_BG)
+        self.info_frame.grid(row=7, column=0, sticky="ew")
+        for column in (1, 3):
+            self.info_frame.grid_columnconfigure(column, weight=1, uniform="key_fields")
+        tk.Label(self.info_frame, text="Keybinds", bg=UI_BG, fg=UI_TEXT, font=self.heading_font).grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, u(6)))
+        self.key_combos = {}
+        self.create_keybind_row(self.info_frame, 1, "Next Mod", self.keys["next"], "Prev Mod", self.keys["prev"])
+        self.create_keybind_row(self.info_frame, 2, "Shuffle", self.keys["shuffle"], "", None)
+        self.create_keybind_row(self.info_frame, 3, "Auto-Cycle", self.keys["auto"], "Auto-Shuffle", self.keys["auto_shuf"])
+
+        self.create_separator(self.content_frame, 8, pady=(u(12), u(12)))
+        self.profile_frame = tk.Frame(self.content_frame, bg=UI_BG)
+        self.profile_frame.grid(row=9, column=0, sticky="ew")
+        self.profile_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(self.profile_frame, text="Profile", bg=UI_BG, fg=UI_TEXT, font=self.body_font).grid(
+            row=0, column=0, padx=(0, u(16)))
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(self.profile_frame, textvariable=self.profile_var, state="readonly",
+                                           style="Cycler.TCombobox", font=self.body_font, width=18)
+        self.profile_combo.bind("<<ComboboxSelected>>", self.load_selected_profile)
+        self.profile_combo.grid(row=0, column=1, sticky="ew", padx=(0, u(12)))
+        self.save_profile_btn = self.create_ui_button(self.profile_frame, "SAVE", self.save_current_profile)
+        self.save_profile_btn.grid(row=0, column=2, sticky="ns", ipadx=u(12))
+
+        self.footer_frame = tk.Frame(self.content_frame, bg=UI_BG)
+        self.footer_frame.grid(row=10, column=0, sticky="ew", pady=(u(12), u(10)))
+        self.support_btn = self.create_ui_button(self.footer_frame, "SUPPORT ME", self.open_support_page)
+        self.support_btn.pack(side="right", ipadx=u(12))
+        self.gen_btn = self.create_ui_button(self.content_frame, "GENERATE .INI", self.generate_ini)
+        self.gen_btn.grid(row=11, column=0, sticky="ew", ipady=u(6))
+
+        self.grip = tk.Canvas(root, width=u(14), height=u(14), bg=UI_BG,
+                               highlightthickness=0, cursor="bottom_right_corner")
+        self.grip.place(relx=1.0, rely=1.0, anchor="se")
+        self.grip.bind("<ButtonPress-1>", self.start_resize)
+        self.grip.bind("<B1-Motion>", self.do_resize)
+        self.apply_ui_style()
+
+    def configure_ui_styles(self):
+        u = self.ui_pixels
+        self.style = ttk.Style(self.root)
+        self.style.theme_use("clam")
+        self.style.configure("Cycler.TCombobox", fieldbackground=UI_FIELD, background=UI_FIELD,
+                             foreground=UI_TEXT, bordercolor=UI_BORDER, lightcolor=UI_BORDER,
+                             darkcolor=UI_BORDER, arrowcolor=UI_TEXT, arrowsize=u(13),
+                             padding=(u(8), u(7)))
+        self.style.map("Cycler.TCombobox", fieldbackground=[("readonly", UI_FIELD), ("focus", UI_FIELD)],
+                       foreground=[("readonly", UI_TEXT)], selectbackground=[("!disabled", UI_FIELD)],
+                       selectforeground=[("!disabled", UI_TEXT)], bordercolor=[("focus", self.ui_color)])
+        self.style.configure("Cycler.Vertical.TScrollbar", gripcount=0, background="#45464b",
+                             troughcolor=UI_PANEL, bordercolor=UI_BORDER, arrowcolor=UI_MUTED,
+                             lightcolor="#45464b", darkcolor="#45464b", arrowsize=u(16))
+        self.style.map("Cycler.Vertical.TScrollbar", background=[("active", "#606168")])
+        self.root.option_add("*TCombobox*Listbox.background", UI_FIELD)
+        self.root.option_add("*TCombobox*Listbox.foreground", UI_TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", self.ui_color)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
+        self.root.option_add("*TCombobox*Listbox.font", self.body_font)
+
+    def create_ui_button(self, parent, text, command):
+        u = self.ui_pixels
+        return tk.Button(parent, text=text, command=command, bg=self.ui_color, fg="white",
+                         activebackground="#008be0", activeforeground="white", relief="flat", bd=0,
+                         highlightthickness=1, highlightbackground="#168edf", highlightcolor="white",
+                         font=("Segoe UI", -u(15), "bold"), cursor="hand2", padx=u(12), pady=u(8))
+
+    def create_checkbox_images(self, bg):
+        # Supersampling makes crisp ticks without external image assets.
+        size, gap, factor = self.ui_pixels(22), self.ui_pixels(10), 4
+        images = []
+        for selected in (False, True):
+            image = Image.new("RGB", ((size + gap) * factor, size * factor), bg)
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((factor, factor, (size - 1) * factor, (size - 1) * factor),
+                           fill=self.ui_color if selected else bg,
+                           outline="#168edf" if selected else "#96979c", width=factor)
+            if selected:
+                draw.line([(size * 0.23 * factor, size * 0.51 * factor),
+                           (size * 0.43 * factor, size * 0.72 * factor),
+                           (size * 0.79 * factor, size * 0.30 * factor)],
+                          fill="white", width=3 * factor, joint="curve")
+            images.append(ImageTk.PhotoImage(image.resize((size + gap, size), Image.Resampling.LANCZOS),
+                                             master=self.root))
+        return tuple(images)
+
+    def create_checkbox(self, parent, text, variable, command, bg, font=None):
+        unchecked, checked = self.checkbox_images[bg]
+        return tk.Checkbutton(parent, text=text, variable=variable, command=command,
+                              image=unchecked, selectimage=checked, compound="left", indicatoron=False,
+                              bg=bg, fg=UI_TEXT, selectcolor=bg, activebackground=bg,
+                              activeforeground=UI_TEXT, font=font or self.body_font, anchor="w", justify="left",
+                              relief="flat", offrelief="flat", overrelief="flat", bd=0, highlightthickness=1,
+                              highlightbackground=bg, highlightcolor=self.ui_color,
+                              padx=0, pady=self.ui_pixels(2), cursor="hand2")
+
+    def create_separator(self, parent, row, pady=0):
+        tk.Frame(parent, bg=UI_BORDER, height=1).grid(row=row, column=0, sticky="ew", pady=pady)
 
     def open_support_page(self):
         webbrowser.open(SUPPORT_URL)
 
-    def check_for_updates(self):
-        self.set_update_button("CHECKING...", False)
-        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
-
-    def _check_for_updates_worker(self):
-        try:
-            update_info = get_latest_update_info()
-            self.root.after(0, lambda: self.handle_update_result(update_info))
-        except Exception as e:
-            self.root.after(0, lambda err=e: self.handle_update_error(err))
-
-    def handle_update_error(self, error):
-        self.set_update_button()
-        messagebox.showerror("Update Check Failed", str(error))
-
-    def handle_update_result(self, update_info):
-        self.set_update_button()
-        latest_version = update_info["version"]
-        if compare_versions(latest_version, APP_VERSION) <= 0:
-            messagebox.showinfo("No Update Available", f"Mod Cycler {APP_VERSION} is current.\n\nLatest GitHub version: {latest_version}")
-            return
-
-        message = f"Mod Cycler {latest_version} is available.\nCurrent version: {APP_VERSION}\n\n"
-        if update_info.get("asset_url") and update_info.get("installable") and getattr(sys, "frozen", False):
-            choice = messagebox.askyesnocancel(
-                "Update Available",
-                message + "Yes: download and install now\nNo: open GitHub release page\nCancel: do nothing"
-            )
-            if choice is True:
-                self.download_and_install_update(update_info)
-            elif choice is False:
-                webbrowser.open(update_info["url"])
-            return
-
-        if messagebox.askyesno("Update Available", message + "Open the GitHub release page?"):
-            webbrowser.open(update_info["url"])
-
-    def download_and_install_update(self, update_info):
-        self.set_update_button("DOWNLOADING...", False)
-        threading.Thread(target=self._download_update_worker, args=(update_info,), daemon=True).start()
-
-    def _download_update_worker(self, update_info):
-        try:
-            download_path = download_update_asset(update_info["asset_url"], update_info.get("asset_name", ""))
-            self.root.after(0, lambda: self.install_downloaded_update(download_path))
-        except Exception as e:
-            self.root.after(0, lambda err=e: self.handle_update_error(err))
-
-    def install_downloaded_update(self, download_path):
-        self.set_update_button()
-        if not getattr(sys, "frozen", False):
-            messagebox.showinfo("Update Downloaded", f"Downloaded update to:\n{download_path}\n\nOpen the release page to install it manually.")
-            webbrowser.open(GITHUB_RELEASES_URL)
-            return
-
-        if not messagebox.askyesno("Install Update", "Update downloaded. Mod Cycler will close, replace the EXE, and restart.\n\nInstall now?"):
-            return
-
-        try:
-            updater_script = write_updater_script(download_path, sys.executable, os.getpid())
-            subprocess.Popen(
-                ["cmd.exe", "/c", updater_script],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception as e:
-            messagebox.showerror("Install Failed", f"Could not start updater:\n{e}")
-            return
-
-        self.quit_app()
-
-    def update_ui_theme(self):
-        self.style.map("Vertical.TScrollbar", background=[('active', self.ui_color)])
-        self.root.option_add('*TCombobox*Listbox.selectBackground', self.ui_color)
-
-        try:
-            self.theme_btn.config(bg=self.ui_color, activebackground=self.ui_color)
-        except AttributeError:
-            pass
-
-        self.gen_btn.config(bg=self.ui_color, activebackground=self.ui_color)
-        self.browse_btn.config(bg=self.ui_color, activebackground=self.ui_color)
-        self.update_btn.config(bg=self.ui_color, activebackground=self.ui_color)
-        self.support_btn.config(bg=self.ui_color, activebackground=self.ui_color)
-        self.save_profile_btn.config(bg=self.ui_color, activebackground=self.ui_color)
-        self.title_lbl.config(fg=self.ui_color)
-        self.close_btn.config(activebackground="#ff1123")
-        self.min_btn.config(activebackground=self.ui_color)
-        self.alpha_scale.config(activebackground=self.ui_color)
-        self.master_cb.config(activeforeground="#ffffff", fg=self.ui_color)
-        self.groups_lbl.config(fg=self.ui_color)
-
-        # FIX 2: Recolor keybind labels directly via stored self.info_frame reference.
-        for widget in self.info_frame.winfo_children():
-            if isinstance(widget, tk.Label):
-                text = widget.cget("text")
-                # Color the key-name labels (e.g. "Next Mod:", "Shuffle:") with theme color
-                if text and "Custom Keybinds" not in text and text.endswith(":"):
-                    widget.config(fg=self.ui_color)
-
+    def apply_ui_style(self):
+        self.gen_btn.configure(bg=self.ui_color, activebackground="#008be0", text="GENERATE .INI")
         self.grip.delete("all")
-        self.grip.create_line(5, 15, 15, 5, fill=self.ui_color, width=2)
-        self.grip.create_line(10, 15, 15, 10, fill=self.ui_color, width=2)
-
-        self.regrid_checkboxes()
+        for offset in (4, 9):
+            self.grip.create_line(self.ui_pixels(offset), self.ui_pixels(14),
+                                  self.ui_pixels(14), self.ui_pixels(offset), fill="#94959b", width=2)
 
     def rename_group_ui(self, event, gid, current_name):
         new_name = simpledialog.askstring("Rename Group", f"Enter nickname for Group {gid}:", initialvalue=current_name)
@@ -748,29 +600,44 @@ class GeneratorApp:
     def use_target_nicknames(self):
         self.nickname_key = self.get_path_key()
         self.nicknames = self.nicknames_by_path.setdefault(self.nickname_key, {})
+        if self.legacy_nicknames and self.nickname_key == self.legacy_nickname_key:
+            for gid, name in self.legacy_nicknames.items():
+                self.nicknames.setdefault(gid, name)
+            self.legacy_nicknames.clear()
+            self._nicknames_migrated = True
 
     def create_keybind_row(self, parent, row, label1, var1, label2, var2):
-        tk.Label(parent, text=label1, bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 8)).grid(row=row, column=0, sticky="e", padx=(0, 5), pady=2)
-        ttk.Combobox(parent, textvariable=var1, values=self.key_options, width=10).grid(row=row, column=1, sticky="w", pady=2)
-        if label2 and var2:
-            tk.Label(parent, text=label2, bg="#1e1e1e", fg="#aaaaaa", font=("Segoe UI", 8)).grid(row=row, column=2, sticky="e", padx=(15, 5), pady=2)
-            ttk.Combobox(parent, textvariable=var2, values=self.key_options, width=10).grid(row=row, column=3, sticky="w", pady=2)
+        for column, label, variable in ((0, label1, var1), (2, label2, var2)):
+            if variable is None:
+                continue
+            tk.Label(parent, text=label, bg=UI_BG, fg=UI_TEXT, font=self.body_font).grid(
+                row=row, column=column, sticky="w",
+                padx=(self.ui_pixels(24) if column == 2 else 0, self.ui_pixels(10)))
+            combo = ttk.Combobox(parent, textvariable=variable, values=self.key_options, width=9,
+                                  style="Cycler.TCombobox", font=self.small_font)
+            combo.grid(row=row, column=column + 1, sticky="ew", pady=self.ui_pixels(4))
+            key = next(name for name, value in self.keys.items() if value is variable)
+            self.key_combos[key] = combo
 
     def on_canvas_resize(self, event):
-        columns = max(1, event.width // 240)
-        if getattr(self, 'current_columns', 0) != columns:
-            self.current_columns = columns
+        self.canvas.itemconfigure(self.groups_window, width=event.width)
+        self.regrid_checkboxes()
+
+    def refresh_group_layout(self):
+        if hasattr(self, "canvas"):
+            self.canvas.itemconfigure(self.groups_window, width=max(1, self.canvas.winfo_width()))
             self.regrid_checkboxes()
-        self.root.after(50, lambda: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
     def regrid_checkboxes(self):
-        cols = max(1, getattr(self, 'current_columns', 1))
+        # Keep the chosen single-column layout even when the window is widened.
+        canvas_width = self.canvas.winfo_width()
+        if canvas_width <= 1:
+            canvas_width = self.minimum_size[0] - self.ui_pixels(44)
+        width = max(1, canvas_width - self.ui_pixels(64))
         for index, widget in enumerate(self.group_widgets):
-            widget.grid(row=index // cols, column=index % cols, sticky="w", padx=5, pady=2)
-            if isinstance(widget, tk.Checkbutton):
-                widget.config(activeforeground="#ffffff", activebackground="#252526", fg="#ffffff")
-            else:
-                widget.config(fg=widget.cget("fg"))
+            widget.grid(row=index, column=0, sticky="ew", padx=self.ui_pixels(12), pady=self.ui_pixels(2))
+            widget.configure(wraplength=width)
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def clear_generation_warning_labels(self):
         kept_widgets = []
@@ -786,62 +653,54 @@ class GeneratorApp:
     def load_config(self):
         config = {
             "mods_path": BASE,
-            "ui_alpha": 0.95,
-            "ui_color": "#007acc",
-            "keys": {
-                "next": "PGUP",
-                "prev": "PGDN",
-                "shuffle": "INSERT",
-                "auto": "CAPSLOCK",
-                "auto_shuf": "END"
-            },
+            "keys": DEFAULT_KEYS.copy(),
             "nicknames_by_path": {},
             "legacy_nicknames": {},
             "favorite_only": False,
         }
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r', encoding="utf-8") as f:
-                    data = json.load(f)
-                    config["mods_path"] = data.get("mods_path", BASE)
-                    config["ui_alpha"] = data.get("ui_alpha", 0.95)
-                    config["ui_color"] = data.get("ui_color", "#007acc")
-                    config["favorite_only"] = bool(data.get("favorite_only", False))
-                    nicknames_by_path = data.get("nicknames_by_path", {})
-                    if isinstance(nicknames_by_path, dict):
-                        config["nicknames_by_path"] = {
-                            str(path_key): {str(gid): str(name) for gid, name in names.items() if str(name)}
-                            for path_key, names in nicknames_by_path.items()
-                            if isinstance(names, dict)
-                        }
-                    legacy_nicknames = data.get("legacy_nicknames", data.get("nicknames", {}))
-                    if isinstance(legacy_nicknames, dict):
-                        config["legacy_nicknames"] = {str(gid): str(name) for gid, name in legacy_nicknames.items() if str(name)}
-                    if "keys" in data:
-                        config["keys"].update(data["keys"])
-            except Exception as e:
-                print(f"[Mod Cycler] Failed to load config: {e}")
+        if not os.path.exists(CONFIG_FILE):
+            return config
+        try:
+            data = read_json_object(CONFIG_FILE)
+        except (OSError, ValueError, UnicodeError) as error:
+            print(f"[Mod Cycler] Failed to load config: {error}")
+            return config
+
+        mods_path = data.get("mods_path")
+        if isinstance(mods_path, str) and mods_path.strip() and "\0" not in mods_path:
+            config["mods_path"] = mods_path
+        if isinstance(data.get("favorite_only"), bool):
+            config["favorite_only"] = data["favorite_only"]
+        keys = data.get("keys", {})
+        if isinstance(keys, dict):
+            for name in config["keys"]:
+                value = clean_keybind(keys.get(name))
+                if value:
+                    config["keys"][name] = value
+        names_by_path = data.get("nicknames_by_path", {})
+        if isinstance(names_by_path, dict):
+            config["nicknames_by_path"] = {
+                key: clean_nicknames(names) for key, names in names_by_path.items()
+                if isinstance(key, str) and isinstance(names, dict)
+            }
+        config["legacy_nicknames"] = clean_nicknames(data.get("legacy_nicknames", data.get("nicknames", {})))
         return config
 
     def save_config(self):
         try:
-            os.makedirs(APPDATA_DIR, exist_ok=True)
             self.nicknames_by_path[self.nickname_key] = self.nicknames
-            with open(CONFIG_FILE, 'w', encoding="utf-8") as f:
-                json.dump({
-                    "mods_path": self.target_dir,
-                    "ui_alpha": self.ui_alpha,
-                    "ui_color": self.ui_color,
-                    "favorite_only": self.favorite_only_var.get(),
-                    "keys": {k: v.get() for k, v in self.keys.items()},
-                    "nicknames_by_path": self.nicknames_by_path,
-                    "legacy_nicknames": self.legacy_nicknames,
-                    "nicknames": {}
-                }, f, indent=2)
-        except Exception as e:
-            print(f"[Mod Cycler] Failed to save config: {e}")
+            write_json_atomic(CONFIG_FILE, {
+                "mods_path": self.target_dir,
+                "favorite_only": self.favorite_only_var.get(),
+                "keys": {key: value.get() for key, value in self.keys.items()},
+                "nicknames_by_path": self.nicknames_by_path,
+                "legacy_nicknames": self.legacy_nicknames,
+                "nicknames": {},
+            })
+        except (OSError, ValueError) as error:
+            print(f"[Mod Cycler] Failed to save config: {error}")
 
-    def truncate_path(self, path, max_len=40):
+    def truncate_path(self, path, max_len=52):
         return "..." + path[-(max_len - 3):] if len(path) > max_len else path
 
     def browse_folder(self):
@@ -859,8 +718,8 @@ class GeneratorApp:
         self.start_w, self.start_h = self.root.winfo_width(), self.root.winfo_height()
 
     def do_resize(self, event):
-        new_w = max(320, self.start_w + (event.x_root - self.start_x))
-        new_h = max(580, self.start_h + (event.y_root - self.start_y))
+        new_w = max(self.minimum_size[0], self.start_w + (event.x_root - self.start_x))
+        new_h = max(self.minimum_size[1], self.start_h + (event.y_root - self.start_y))
         self.root.geometry(f"{new_w}x{new_h}")
 
     def _on_mousewheel(self, event):
@@ -871,8 +730,7 @@ class GeneratorApp:
             var.set(self.master_var.get())
 
     def sync_master_var(self):
-        if self.group_vars:
-            self.master_var.set(all(var.get() for var in self.group_vars.values()))
+        self.master_var.set(bool(self.group_vars) and all(var.get() for var in self.group_vars.values()))
 
     def get_cycler_dir(self):
         return os.path.join(self.target_dir, CYCLER_DIR_NAME)
@@ -908,21 +766,18 @@ class GeneratorApp:
         if not os.path.exists(state_path):
             return {}
         try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            return state if isinstance(state, dict) else {}
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"[Mod Cycler] Failed to load generation state: {e}")
+            return read_json_object(state_path)
+        except (OSError, ValueError, UnicodeError) as error:
+            print(f"[Mod Cycler] Failed to load generation state: {error}")
             return {}
 
     def save_generation_state(self, final_groups):
-        state_path = self.get_state_path()
-        tmp_path = state_path + ".tmp"
         groups = {
             str(group["id"]): {
                 "slots": int(group["slots"]),
                 "all_slots": int(group.get("all_slots", group["slots"])),
                 "favorite_slots": list(group.get("favorite_slots", [])),
+                "mod_names": list(self.group_mod_names.get(group["id"], [])),
                 "name": self.nicknames.get(str(group["id"]), ""),
             }
             for group in final_groups
@@ -931,86 +786,87 @@ class GeneratorApp:
             str(gid): {
                 "slots": int(slots),
                 "favorite_slots": list(self.group_favorite_slots.get(gid, [])),
+                "mod_names": list(self.group_mod_names.get(gid, [])),
             }
             for gid, slots in self.group_slot_counts.items()
             if slots >= 2
         }
-        state = {
-            "version": 1,
+        write_json_atomic(self.get_state_path(), {
+            "version": 2,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "active_ini": ACTIVE_INI_NAME,
+            "ini_sha256": file_sha256(self.get_active_ini_path()),
             "favorite_only": self.favorite_only_var.get(),
             "groups": groups,
             "detected_groups": detected_groups,
-        }
-        os.makedirs(self.get_cycler_dir(), exist_ok=True)
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp_path, state_path)
+        })
 
     def get_generation_warnings(self):
         state = self.load_generation_state()
+        ini_path = self.get_active_ini_path()
         generated_groups = state.get("groups", {})
         if not isinstance(generated_groups, dict) or not generated_groups:
-            return []
+            return ["Cycler snapshot is missing or invalid; generate again."] if os.path.exists(ini_path) else []
+        warnings = []
+        if not os.path.isfile(ini_path):
+            warnings.append("The generated mod_cycler.ini is missing.")
+        elif isinstance(state.get("ini_sha256"), str):
+            try:
+                if file_sha256(ini_path) != state["ini_sha256"]:
+                    warnings.append("The active mod_cycler.ini was changed outside Mod Cycler.")
+            except OSError:
+                warnings.append("The active mod_cycler.ini could not be read.")
         detected_at_generate = state.get("detected_groups", {})
         if not isinstance(detected_at_generate, dict):
             detected_at_generate = {}
-        favorite_only = bool(state.get("favorite_only", False))
+        favorite_only = state.get("favorite_only", False)
+        if not isinstance(favorite_only, bool):
+            warnings.append("Cycler snapshot contains an invalid Favorites setting; generate again.")
+            favorite_only = False
 
-        warnings = []
         generated_ids = {str(gid) for gid in generated_groups}
         previously_detected_ids = {str(gid) for gid in detected_at_generate}
         for gid in sorted(self.group_slot_counts):
-            current_slots = self.group_slot_counts.get(gid, 0)
-            current_effective_slots = self.group_favorite_slot_counts.get(gid, 0) if favorite_only else current_slots
-            minimum_slots = 1 if favorite_only else 2
-            if current_effective_slots < minimum_slots:
+            current_slots = self.group_slot_counts[gid]
+            if current_slots < 2:
                 continue
-
+            current_effective_slots = self.group_favorite_slot_counts.get(gid, 0) if favorite_only else current_slots
+            if current_effective_slots < (1 if favorite_only else 2):
+                continue
             group_key = str(gid)
             generated = generated_groups.get(group_key)
             if generated is None:
                 if group_key not in previously_detected_ids:
-                    warnings.append(
-                        f"New Group {gid} has {current_effective_slots} {'favorite(s)' if favorite_only else 'mods'} but is not in the generated cycler."
-                    )
+                    warnings.append(f"New Group {gid} is not in the generated cycler.")
                 continue
-
-            try:
-                generated_slots = int(generated.get("slots", 0))
-            except (TypeError, ValueError):
-                generated_slots = 0
-
+            if not isinstance(generated, dict):
+                warnings.append(f"Group {gid} has invalid snapshot data; generate again.")
+                continue
+            generated_slots = parse_group_id(generated.get("slots"))
             if generated_slots != current_effective_slots:
                 warnings.append(
-                    f"Group {gid} has {current_effective_slots} {'favorite(s)' if favorite_only else 'mods'}; generated cycler has {generated_slots}."
+                    f"Group {gid} has {current_effective_slots} {'favorite(s)' if favorite_only else 'mods'}; "
+                    f"generated cycler has {generated_slots if generated_slots is not None else 'invalid data'}."
                 )
             elif favorite_only:
-                generated_favorites = generated.get("favorite_slots", [])
-                if not isinstance(generated_favorites, list):
-                    generated_favorites = []
-                if generated_favorites != self.group_favorite_slots.get(gid, []):
+                if generated.get("favorite_slots", []) != self.group_favorite_slots.get(gid, []):
                     warnings.append(f"Group {gid} has different favorited mods than the generated cycler.")
+            elif "mod_names" in generated and generated["mod_names"] != self.group_mod_names.get(gid, []):
+                warnings.append(f"Group {gid} contains different mod folders than the generated cycler.")
 
-        missing_generated = []
         current_ids = {
-            str(gid)
-            for gid, count in self.group_slot_counts.items()
-            if (self.group_favorite_slot_counts.get(gid, 0) >= 1 if favorite_only else count >= 2)
+            str(gid) for gid, count in self.group_slot_counts.items()
+            if count >= 2 and (not favorite_only or self.group_favorite_slot_counts.get(gid, 0) >= 1)
         }
-        sort_key = lambda value: (0, int(value)) if value.isdigit() else (1, value)
-        for group_key in sorted(generated_ids - current_ids, key=sort_key):
-            missing_generated.append(group_key)
+        missing_generated = generated_ids - current_ids
         if missing_generated:
-            warnings.append(
-                f"{len(missing_generated)} generated group(s) are no longer valid in _MANAGED_."
-            )
-
+            warnings.append(f"{len(missing_generated)} generated group(s) are no longer valid in _MANAGED_.")
         return warnings
 
     def safe_profile_name(self, name):
         safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(name or "")).strip(" .")
+        if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", safe_name.split(".")[0], re.IGNORECASE):
+            safe_name = "_" + safe_name
         return safe_name[:80] or "Profile"
 
     def get_profile_path(self, name):
@@ -1020,12 +876,13 @@ class GeneratorApp:
         profiles_dir = self.get_profiles_dir()
         if not os.path.isdir(profiles_dir):
             return []
-        names = []
-        for filename in os.listdir(profiles_dir):
-            if filename.lower().endswith(".json"):
-                names.append(os.path.splitext(filename)[0])
-        names.sort(key=str.lower)
-        return names
+        try:
+            names = [os.path.splitext(filename)[0] for filename in os.listdir(profiles_dir)
+                     if filename.lower().endswith(".json") and os.path.isfile(os.path.join(profiles_dir, filename))]
+        except OSError as error:
+            print(f"[Mod Cycler] Could not list profiles: {error}")
+            return []
+        return sorted(names, key=str.lower)
 
     def refresh_profile_list(self, select_name=None):
         if not hasattr(self, "profile_combo"):
@@ -1058,22 +915,11 @@ class GeneratorApp:
         if not name:
             return
         profile_name = self.safe_profile_name(name)
-        profile_path = self.get_profile_path(profile_name)
-        tmp_path = profile_path + ".tmp"
         try:
-            os.makedirs(self.get_profiles_dir(), exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self.collect_profile_data(profile_name), f, indent=2)
-            os.replace(tmp_path, profile_path)
-        except OSError as e:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-            messagebox.showerror("Profile Save Failed", f"Could not save profile:\n{e}")
+            write_json_atomic(self.get_profile_path(profile_name), self.collect_profile_data(profile_name))
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Profile Save Failed", f"Could not save profile:\n{error}")
             return
-
         self.refresh_profile_list(profile_name)
         messagebox.showinfo("Profile Saved", f"Saved profile:\n{profile_name}")
 
@@ -1081,37 +927,53 @@ class GeneratorApp:
         profile_name = self.profile_var.get()
         if not profile_name:
             return
-
-        profile_path = self.get_profile_path(profile_name)
         try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                profile = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            messagebox.showerror("Profile Load Failed", f"Could not load profile:\n{e}")
+            profile = read_json_object(self.get_profile_path(profile_name))
+            interval = profile.get("interval")
+            if interval is not None:
+                if isinstance(interval, bool) or not re.fullmatch(r"[0-9]+", str(interval).strip()):
+                    raise ValueError("Profile interval must be a positive integer.")
+                interval = int(str(interval).strip())
+                if interval < 1:
+                    raise ValueError("Profile interval must be at least 1 second.")
+            raw_keys = profile.get("keys", {})
+            if not isinstance(raw_keys, dict):
+                raise ValueError("Profile keys must be an object.")
+            keys = {}
+            for name in self.keys:
+                if name in raw_keys:
+                    value = clean_keybind(raw_keys[name])
+                    if not value:
+                        raise ValueError(f"Profile keybind '{name}' is invalid.")
+                    keys[name] = value
+            favorite_only = profile.get("favorite_only", False)
+            if not isinstance(favorite_only, bool):
+                raise ValueError("Profile Favorites setting must be true or false.")
+            raw_groups = profile.get("selected_groups", [])
+            if not isinstance(raw_groups, list):
+                raise ValueError("Profile selected groups must be a list.")
+            selected_groups = set()
+            for raw_gid in raw_groups:
+                gid = parse_group_id(raw_gid)
+                if gid is None:
+                    raise ValueError("Profile contains an invalid group ID.")
+                selected_groups.add(gid)
+        except (OSError, ValueError, UnicodeError) as error:
+            messagebox.showerror("Profile Load Failed", f"Could not load profile:\n{error}")
             return
 
-        interval = str(profile.get("interval", "")).strip()
-        if interval:
-            self.timer_var.set(interval)
-
-        keys = profile.get("keys", {})
-        if isinstance(keys, dict):
-            for key_name, value in keys.items():
-                if key_name in self.keys and str(value).strip():
-                    self.keys[key_name].set(str(value).strip())
-        self.favorite_only_var.set(bool(profile.get("favorite_only", False)))
-
-        raw_selected_groups = profile.get("selected_groups", [])
-        if not isinstance(raw_selected_groups, (list, tuple, set)):
-            raw_selected_groups = []
-        selected_groups = {int(gid) for gid in raw_selected_groups if str(gid).isdigit()}
+        self.refresh_groups()
+        if interval is not None:
+            self.timer_var.set(str(interval))
+        for name, value in keys.items():
+            self.keys[name].set(value)
+        self.favorite_only_var.set(favorite_only)
         detected_groups = set(self.group_vars)
         for gid, var in self.group_vars.items():
             var.set(gid in selected_groups)
         self.sync_master_var()
         self.save_config()
-
-        missing_groups = sorted(selected_groups - detected_groups)
+        missing_groups = selected_groups - detected_groups
         if missing_groups:
             messagebox.showwarning(
                 "Profile Partially Loaded",
@@ -1234,6 +1096,11 @@ class GeneratorApp:
         return "Unknown"
 
     def refresh_groups(self):
+        managed_path = self.refresh_target_dir()
+        path_key = self.get_path_key()
+        same_target = self._groups_path_key == path_key
+        previous_selection = {gid: var.get() for gid, var in self.group_vars.items()} if same_target else {}
+        self._groups_path_key = path_key
         for widget in self.scroll_frame.winfo_children():
             widget.destroy()
         self.group_widgets.clear()
@@ -1241,11 +1108,10 @@ class GeneratorApp:
         self.group_slot_counts.clear()
         self.group_favorite_slot_counts.clear()
         self.group_favorite_slots.clear()
+        self.group_mod_names.clear()
+        self.group_unresolved_favorites.clear()
         self.duplicate_group_paths.clear()
-        # FIX 3: Also clear group_vars so stale entries from a previous folder don't linger.
         self.group_vars.clear()
-
-        managed_path = self.refresh_target_dir()
         if not managed_path:
             if self.legacy_managed_path:
                 legacy_name = os.path.basename(self.legacy_managed_path)
@@ -1255,13 +1121,15 @@ class GeneratorApp:
                 )
             else:
                 text = "No _MANAGED_ folder found. Select Mods, the XXMI root, or an NRMM managed folder."
-            lbl = tk.Label(self.scroll_frame, text=text, bg="#252526", fg="#ff4444", font=("Segoe UI", 9),
+            lbl = tk.Label(self.scroll_frame, text=text, bg=UI_PANEL, fg="#ff7777", font=self.body_font,
                            wraplength=300, justify="left")
-            lbl.grid(row=0, column=0, pady=10, padx=10)
             self.group_widgets.append(lbl)
+            self.regrid_checkboxes()
+            self.sync_master_var()
             return
 
         group_folders = []
+        seen_group_ids = set()
         # Deep scan: find group folders anywhere inside _MANAGED_
         for root_dir, dirs, _ in os.walk(managed_path):
             dirs.sort(key=str.lower)
@@ -1272,29 +1140,34 @@ class GeneratorApp:
                     found_group_dirs.append(d)
                     gid = int(m.group(1))
                     gpath = os.path.join(root_dir, d)
-                    if gid in self.group_paths:
+                    if gid in seen_group_ids:
                         self.duplicate_group_paths.append(gpath)
                         continue
+                    seen_group_ids.add(gid)
                     try:
                         subs = [f for f in os.listdir(gpath) if os.path.isdir(os.path.join(gpath, f)) and not f.startswith("_")]
                         subs.sort()
+                        self.group_paths[gid] = gpath
+                        self.group_mod_names[gid] = subs
                         self.group_slot_counts[gid] = len(subs)
                         favorite_slots = []
+                        unresolved_favorites = []
                         for mod_name in subs:
                             mod_path = os.path.join(gpath, mod_name)
                             if not os.path.isfile(os.path.join(mod_path, "fav")):
                                 continue
                             slot_id = find_managed_slot_id(mod_path)
-                            if slot_id is not None:
+                            if slot_id is not None and slot_id not in favorite_slots:
                                 favorite_slots.append(slot_id)
+                            else:
+                                unresolved_favorites.append(mod_name)
+                        self.group_unresolved_favorites[gid] = unresolved_favorites
                         self.group_favorite_slots[gid] = favorite_slots
                         self.group_favorite_slot_counts[gid] = len(favorite_slots)
                         if len(subs) >= 2:
                             raw_name = self.infer_group_name(subs)
                             display_name = self.nicknames.get(str(gid), raw_name)
                             group_folders.append((gid, display_name))
-                            # FIX 4: Cache the actual found path so generate_ini uses it correctly.
-                            self.group_paths[gid] = gpath
                     except Exception as e:
                         print(f"[Mod Cycler] Could not read group folder '{d}': {e}")
                         continue
@@ -1308,30 +1181,30 @@ class GeneratorApp:
             if len(generation_warnings) > 4:
                 preview += f"\n+{len(generation_warnings) - 4} more cycler mismatch(es)."
             lbl = tk.Label(self.scroll_frame, text=f"Cycler out of date:\n{preview}",
-                           bg="#252526", fg="#ffcc66", font=("Segoe UI", 9),
+                           bg=UI_PANEL, fg="#ffcc66", font=self.body_font,
                            wraplength=320, justify="left")
             lbl.is_generation_warning = True
             self.group_widgets.append(lbl)
 
         group_folders.sort()
         for gid, name in group_folders:
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=previous_selection.get(gid, not same_target))
             self.group_vars[gid] = var
-            cb = tk.Checkbutton(self.scroll_frame, text=f"Group {gid} ({name})", variable=var,
-                                bg="#252526", selectcolor="#1e1e1e", activebackground="#252526",
-                                font=("Segoe UI", 9), wraplength=220, justify="left")
+            cb = self.create_checkbox(self.scroll_frame, f"Group {gid} ({name})", var,
+                                      self.sync_master_var, UI_PANEL)
             cb.bind("<Button-3>", lambda e, g=gid, n=name: self.rename_group_ui(e, g, n))
             self.group_widgets.append(cb)
 
         if not group_folders:
-            lbl = tk.Label(self.scroll_frame, text="No valid group folders found.", bg="#252526", fg="#ff4444", font=("Segoe UI", 9))
+            lbl = tk.Label(self.scroll_frame, text="No valid group folders found.", bg=UI_PANEL, fg="#ff7777", font=self.body_font)
             self.group_widgets.append(lbl)
 
         if self.duplicate_group_paths:
             skipped = len(self.duplicate_group_paths)
-            lbl = tk.Label(self.scroll_frame, text=f"{skipped} duplicate group ID(s) skipped.", bg="#252526", fg="#ffcc66", font=("Segoe UI", 9))
+            lbl = tk.Label(self.scroll_frame, text=f"{skipped} duplicate group ID(s) skipped.", bg=UI_PANEL, fg="#ffcc66", font=self.body_font)
             self.group_widgets.append(lbl)
 
+        self.sync_master_var()
         self.regrid_checkboxes()
 
     def start_move(self, event):
@@ -1353,36 +1226,102 @@ class GeneratorApp:
         self.root.withdraw()
 
     def show_window(self):
+        if self._closing:
+            return
+        self.refresh_groups()
+        self.refresh_profile_list()
         self.is_visible = True
         self.root.deiconify()
         self.root.attributes("-topmost", True)
         self.root.lift()
 
     def show_from_tray(self, icon, item):
-        self.root.after(0, self.show_window)
+        self.post_ui_action(self.show_window)
 
     def toggle_from_hotkey(self):
-        self.root.after(0, self.hide_window if self.is_visible else self.show_window)
+        if not self._closing:
+            (self.hide_window if self.is_visible else self.show_window)()
+
+    def post_ui_action(self, action):
+        if not self._closing:
+            self._ui_actions.put(action)
+
+    def process_ui_actions(self):
+        self._ui_poll_id = None
+        while not self._closing:
+            try:
+                action = self._ui_actions.get_nowait()
+            except queue.Empty:
+                break
+            action()
+        if not self._closing:
+            self._ui_poll_id = self.root.after(100, self.process_ui_actions)
 
     def quit_app(self, icon=None, item=None):
-        ctypes.windll.user32.UnregisterHotKey(None, 1)
+        if threading.get_ident() != self._ui_thread_id:
+            self.post_ui_action(self.quit_app)
+            return
+        if self._closing:
+            return
+        self._closing = True
+        self.save_config()
+        self._hotkey_stop.set()
+        hotkey_thread_id = self._hotkey_thread_id
+        if hotkey_thread_id is not None:
+            user32 = ctypes.windll.user32
+            user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.PostThreadMessageW.restype = wintypes.BOOL
+            user32.PostThreadMessageW(hotkey_thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self.hotkey_thread.is_alive():
+            self.hotkey_thread.join(timeout=1)
         if getattr(self, "tray_icon", None):
             self.tray_icon.stop()
         if self.semaphore_handle:
             ctypes.windll.kernel32.CloseHandle(self.semaphore_handle)
             self.semaphore_handle = None
-        self.root.after(0, self.root.destroy)
+        for callback_id in self.root.tk.call("after", "info"):
+            self.root.after_cancel(callback_id)
+        self.root.destroy()
 
     def listen_for_hotkey(self):
         user32 = ctypes.windll.user32
-        if not user32.RegisterHotKey(None, 1, 0x0001, 0x53):
-            return
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = wintypes.BOOL
         msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-            if msg.message == 0x0312 and msg.wParam == 1:
-                self.root.after(0, self.toggle_from_hotkey)
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # Create this thread's message queue.
+        self._hotkey_thread_id = kernel32.GetCurrentThreadId()
+        registered = False
+        try:
+            if self._hotkey_stop.is_set():
+                return
+            registered = bool(user32.RegisterHotKey(None, 1, HOTKEY_MODIFIERS, HOTKEY_VK))
+            if not registered:
+                error_code = kernel32.GetLastError()
+                self.post_ui_action(lambda: messagebox.showwarning(
+                    "Hotkey Unavailable",
+                    f"Could not register Alt+S (Windows error {error_code}). Use the tray menu to show Mod Cycler.",
+                    parent=self.root,
+                ))
+                return
+            while not self._hotkey_stop.is_set():
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    break
+                if msg.message == 0x0312 and msg.wParam == 1:
+                    self.post_ui_action(self.toggle_from_hotkey)
+        finally:
+            if registered:
+                user32.UnregisterHotKey(None, 1)
+            self._hotkey_thread_id = None
 
     def generate_ini(self):
         self.save_config()
@@ -1410,48 +1349,31 @@ class GeneratorApp:
                 return
             key_values[key_name] = value
 
+        # Refresh the complete inventory before generating; retain existing selections.
+        self.refresh_groups()
         final_groups = []
         groups_without_favorites = []
         unresolved_favorites = []
         for gid, var in self.group_vars.items():
             if not var.get():
                 continue
-            # FIX 4: Use the cached path from refresh_groups instead of reconstructing it.
-            gpath = self.group_paths.get(gid)
-            if gpath and os.path.exists(gpath):
-                try:
-                    mods = [f for f in os.listdir(gpath) if os.path.isdir(os.path.join(gpath, f)) and not f.startswith("_")]
-                except OSError as e:
-                    print(f"[Mod Cycler] Could not read group folder '{gpath}': {e}")
-                    continue
-                self.group_slot_counts[gid] = len(mods)
-                mods.sort()
-                favorite_slots = []
-                for mod_name in mods:
-                    mod_path = os.path.join(gpath, mod_name)
-                    if not os.path.isfile(os.path.join(mod_path, "fav")):
-                        continue
-                    slot_id = find_managed_slot_id(mod_path)
-                    if slot_id is None:
-                        unresolved_favorites.append((gid, mod_name))
-                        continue
-                    favorite_slots.append(slot_id)
-                self.group_favorite_slot_counts[gid] = len(favorite_slots)
-                self.group_favorite_slots[gid] = favorite_slots
-                active_slots = favorite_slots if self.favorite_only_var.get() else list(range(1, len(mods) + 1))
-                if active_slots and (self.favorite_only_var.get() or len(mods) >= 2):
-                    deck = active_slots[:]
-                    random.shuffle(deck)
-                    final_groups.append({
-                        'id': gid,
-                        'slots': len(active_slots),
-                        'all_slots': len(mods),
-                        'favorite_slots': favorite_slots,
-                        'active_slots': active_slots,
-                        'deck': deck,
-                    })
-                elif self.favorite_only_var.get() and len(mods) >= 2:
-                    groups_without_favorites.append(gid)
+            mods = self.group_mod_names.get(gid, [])
+            favorite_slots = self.group_favorite_slots.get(gid, [])
+            unresolved_favorites.extend((gid, name) for name in self.group_unresolved_favorites.get(gid, []))
+            active_slots = favorite_slots if self.favorite_only_var.get() else list(range(1, len(mods) + 1))
+            if active_slots and (self.favorite_only_var.get() or len(mods) >= 2):
+                deck = active_slots[:]
+                random.shuffle(deck)
+                final_groups.append({
+                    'id': gid,
+                    'slots': len(active_slots),
+                    'all_slots': len(mods),
+                    'favorite_slots': favorite_slots,
+                    'active_slots': active_slots,
+                    'deck': deck,
+                })
+            elif self.favorite_only_var.get() and len(mods) >= 2:
+                groups_without_favorites.append(gid)
 
         if not final_groups:
             message = "No selected groups contain favorited mods." if self.favorite_only_var.get() else "No valid groups selected."
@@ -1466,7 +1388,7 @@ class GeneratorApp:
         try:
             os.makedirs(self.get_cycler_dir(), exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write("; v6.6\nnamespace = mod_cycler_indie\\cycler\n\n[Constants]\n")
+                f.write(f"; v{APP_VERSION}\nnamespace = mod_cycler_indie\\cycler\n\n[Constants]\n")
                 f.write("global persist $auto_enable = 0\nglobal persist $shuffle_auto_enable = 0\nglobal persist $last_cycle = 0\n\n")
                 for g in final_groups:
                     if self.favorite_only_var.get():
@@ -1493,24 +1415,30 @@ class GeneratorApp:
                 f.write("\n[CommandListNext]\n")
                 for g in final_groups:
                     if self.favorite_only_var.get():
+                        f.write(f"$g{g['id']}_cycle_pos = -1\n")
+                        for pos, mod_id in enumerate(g['active_slots']):
+                            f.write(f"if $g{g['id']}_slot == {mod_id}\n    $g{g['id']}_cycle_pos = {pos}\nendif\n")
                         f.write(f"$g{g['id']}_cycle_pos = ($g{g['id']}_cycle_pos + 1) % {g['slots']}\n")
                         for pos, mod_id in enumerate(g['active_slots']):
                             f.write(f"if $g{g['id']}_cycle_pos == {pos}\n    $g{g['id']}_slot = {mod_id}\nendif\n")
                     else:
+                        # Saved selections can outlive mods removed before regeneration.
                         f.write(f"$g{g['id']}_slot = $g{g['id']}_slot + 1\n")
-                        f.write(f"if $g{g['id']}_slot > {g['slots']}\n    $g{g['id']}_slot = 1\nendif\n")
+                        f.write(f"if $g{g['id']}_slot > {g['slots']} || $g{g['id']}_slot < 1\n    $g{g['id']}_slot = 1\nendif\n")
                     f.write(f"$\\modmanageragl\\group_{g['id']}\\active_slot = $g{g['id']}_slot\n")
 
                 f.write("\n[CommandListPrev]\n")
                 for g in final_groups:
                     if self.favorite_only_var.get():
-                        f.write(f"$g{g['id']}_cycle_pos = $g{g['id']}_cycle_pos - 1\n")
-                        f.write(f"if $g{g['id']}_cycle_pos < 0\n    $g{g['id']}_cycle_pos = {g['slots'] - 1}\nendif\n")
+                        f.write(f"$g{g['id']}_cycle_pos = 0\n")
+                        for pos, mod_id in enumerate(g['active_slots']):
+                            f.write(f"if $g{g['id']}_slot == {mod_id}\n    $g{g['id']}_cycle_pos = {pos}\nendif\n")
+                        f.write(f"$g{g['id']}_cycle_pos = ($g{g['id']}_cycle_pos + {g['slots']} - 1) % {g['slots']}\n")
                         for pos, mod_id in enumerate(g['active_slots']):
                             f.write(f"if $g{g['id']}_cycle_pos == {pos}\n    $g{g['id']}_slot = {mod_id}\nendif\n")
                     else:
                         f.write(f"$g{g['id']}_slot = $g{g['id']}_slot - 1\n")
-                        f.write(f"if $g{g['id']}_slot < 1\n    $g{g['id']}_slot = {g['slots']}\nendif\n")
+                        f.write(f"if $g{g['id']}_slot < 1 || $g{g['id']}_slot > {g['slots']}\n    $g{g['id']}_slot = {g['slots']}\nendif\n")
                     f.write(f"$\\modmanageragl\\group_{g['id']}\\active_slot = $g{g['id']}_slot\n")
 
                 f.write("\n[CommandListShuffle]\n")
@@ -1518,10 +1446,15 @@ class GeneratorApp:
                     position_name = "shuffle_pos" if self.favorite_only_var.get() else "pos"
                     f.write(f"$g{g['id']}_{position_name} = ($g{g['id']}_{position_name} + 1) % {g['slots']}\n")
                     for pos, mod_id in enumerate(g['deck']):
-                        f.write(f"if $g{g['id']}_{position_name} == {pos}\n    $g{g['id']}_slot = {mod_id}\nendif\n")
+                        f.write(f"if $g{g['id']}_{position_name} == {pos}\n    $g{g['id']}_slot = {mod_id}\n")
+                        if self.favorite_only_var.get():
+                            cycle_pos = g['active_slots'].index(mod_id)
+                            f.write(f"    $g{g['id']}_cycle_pos = {cycle_pos}\n")
+                        f.write("endif\n")
                     f.write(f"$\\modmanageragl\\group_{g['id']}\\active_slot = $g{g['id']}_slot\n\n")
 
                 f.write(f"[Present]\nif $auto_enable == 1 || $shuffle_auto_enable == 1\n")
+                f.write("    if time < $last_cycle\n        $last_cycle = time\n    endif\n")
                 f.write(f"    if time - $last_cycle >= {timer_seconds}\n")
                 f.write(f"        $last_cycle = time\n")
                 f.write(f"        if $auto_enable == 1\n")
@@ -1537,7 +1470,7 @@ class GeneratorApp:
             try:
                 self.save_generation_state(final_groups)
                 self.clear_generation_warning_labels()
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 state_warning = f"\n\nCould not save cycler state snapshot:\n{e}"
         except OSError as e:
             try:
@@ -1545,11 +1478,15 @@ class GeneratorApp:
                     os.remove(tmp_path)
             except OSError:
                 pass
+            if legacy_backup and not os.path.exists(self.get_legacy_root_ini_path()):
+                try:
+                    os.replace(legacy_backup, self.get_legacy_root_ini_path())
+                except OSError as restore_error:
+                    messagebox.showerror("Restore Failed", f"Old root INI is preserved at:\n{legacy_backup}\n\n{restore_error}")
             messagebox.showerror("Error", f"Failed to write mod_cycler.ini:\n{e}")
             return
 
-        self.root.configure(bg="#2b6b3e")
-        self.title_bar.configure(bg="#2b6b3e")
+        self.gen_btn.configure(bg="#2b6b3e", text="GENERATED .INI")
         self.root.after(300, self.reset_generate_ini_colors)
         details = f"Generated:\n{ini_path}\n\nPress F10 in-game."
         if previous_backup:
@@ -1563,13 +1500,11 @@ class GeneratorApp:
             if groups_without_favorites:
                 details += f"\nSkipped {len(groups_without_favorites)} selected group(s) with no favorited mods."
             if unresolved_favorites:
-                details += f"\nSkipped {len(unresolved_favorites)} favorited mod(s) with no NRMM managed slot ID."
+                details += f"\nSkipped {len(unresolved_favorites)} favorited mod(s) with missing or duplicate NRMM managed slot IDs."
         messagebox.showinfo("Success", details)
 
     def reset_generate_ini_colors(self):
-        self.root.configure(bg="#1e1e1e")
-        self.title_bar.configure(bg="#2d2d30")
-        self.update_ui_theme()
+        self.apply_ui_style()
 
 
 if __name__ == "__main__":

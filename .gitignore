@@ -1,0 +1,42 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# PyInstaller output and packaged releases
+/build/
+/dist/
+/.release-audit-*/
+/.publication/
+*.exe
+/*.7z
+/*.zip
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+/htmlcov/
+/coverage.xml
+/.mod-cycler-tests-*/
+
+# Local game data and generated cycler files
+/Mods/
+/_MANAGED_/
+/Mod Cycler/
+/mod_cycler.ini
+/mod_cycler_state.json
+*.tmp
+*.bak
+
+# Local editor and Windows files
+.idea/
+*.swp
+*.swo
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Keep source, tests, docs, UI images, .spec, icon.ico and version.txt tracked.
