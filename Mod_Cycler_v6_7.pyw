@@ -1389,7 +1389,9 @@ class GeneratorApp:
             os.makedirs(self.get_cycler_dir(), exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(f"; v{APP_VERSION}\nnamespace = mod_cycler_indie\\cycler\n\n[Constants]\n")
-                f.write("global persist $auto_enable = 0\nglobal persist $shuffle_auto_enable = 0\nglobal persist $last_cycle = 0\n\n")
+                # Auto modes belong to this session; only outfit selections persist.
+                f.write("global $auto_enable = 0\nglobal $shuffle_auto_enable = 0\nglobal $last_cycle = 0\n")
+                f.write("global $auto_session_initialized = 0\n\n")
                 for g in final_groups:
                     if self.favorite_only_var.get():
                         f.write(
@@ -1406,10 +1408,18 @@ class GeneratorApp:
                 f.write(f"[KeyToggleAuto]\nkey = {key_values['auto']}\nrun = CommandListToggleAuto\n")
                 f.write(f"[KeyToggleShuffleAuto]\nkey = {key_values['auto_shuf']}\nrun = CommandListToggleShuffleAuto\n")
 
-                f.write("\n[CommandListToggleAuto]\n$auto_enable = 1 - $auto_enable\n$shuffle_auto_enable = 0\n")
+                # Older loaders can restore former persistent variables. Reset them
+                # once after settings load, before either a frame or an auto key runs.
+                f.write("\n[CommandListInitializeAutoSession]\nif $auto_session_initialized == 0\n")
+                f.write("    $auto_enable = 0\n    $shuffle_auto_enable = 0\n    $last_cycle = time\n")
+                f.write("    $auto_session_initialized = 1\nendif\n")
+
+                f.write("\n[CommandListToggleAuto]\nrun = CommandListInitializeAutoSession\n")
+                f.write("$auto_enable = 1 - $auto_enable\n$shuffle_auto_enable = 0\n")
                 f.write("if $auto_enable == 1\n    $last_cycle = time\n    run = CommandListNext\nendif\n")
 
-                f.write("\n[CommandListToggleShuffleAuto]\n$shuffle_auto_enable = 1 - $shuffle_auto_enable\n$auto_enable = 0\n")
+                f.write("\n[CommandListToggleShuffleAuto]\nrun = CommandListInitializeAutoSession\n")
+                f.write("$shuffle_auto_enable = 1 - $shuffle_auto_enable\n$auto_enable = 0\n")
                 f.write("if $shuffle_auto_enable == 1\n    $last_cycle = time\n    run = CommandListShuffle\nendif\n")
 
                 f.write("\n[CommandListNext]\n")
@@ -1453,7 +1463,8 @@ class GeneratorApp:
                         f.write("endif\n")
                     f.write(f"$\\modmanageragl\\group_{g['id']}\\active_slot = $g{g['id']}_slot\n\n")
 
-                f.write(f"[Present]\nif $auto_enable == 1 || $shuffle_auto_enable == 1\n")
+                f.write("[Present]\nrun = CommandListInitializeAutoSession\n")
+                f.write("if $auto_enable == 1 || $shuffle_auto_enable == 1\n")
                 f.write("    if time < $last_cycle\n        $last_cycle = time\n    endif\n")
                 f.write(f"    if time - $last_cycle >= {timer_seconds}\n")
                 f.write(f"        $last_cycle = time\n")

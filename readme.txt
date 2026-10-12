@@ -39,6 +39,8 @@ All generated ini controls are rebindable in the app before pressing **GENERATE 
 - **CAPSLOCK:** Toggle Auto-Cycle.
 - **END:** Toggle Auto-Shuffle.
 
+Auto-Cycle and Auto-Shuffle start off whenever the game launches or you press F10 to reload. Enable either mode with its key when needed. Your selected outfit remains saved. After installing a build with this behavior, regenerate the cycling INI and press F10 to apply it.
+
 ## App Hotkey
 
 **Alt + S:** Show or hide the Mod Cycler window while the app is running.

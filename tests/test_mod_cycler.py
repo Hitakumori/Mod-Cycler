@@ -28,9 +28,10 @@ NATIVE_LISTENER = APP.GeneratorApp.listen_for_hotkey
 class IniRunner:
     """Execute the generated command subset in memory, without a game or mod loader."""
 
-    def __init__(self, text):
+    def __init__(self, text, persisted=None, legacy_restore=False):
         self.sections = {}
         self.values = {}
+        self.persistent_names = set()
         self.time = 0
         section = None
         for raw in text.splitlines():
@@ -43,7 +44,16 @@ class IniRunner:
             elif section:
                 self.sections[section].append(line)
         for line in self.sections["Constants"]:
+            if line.startswith("global persist "):
+                self.persistent_names.add(line.removeprefix("global persist ").split("=", 1)[0].strip())
             self.assign(line.removeprefix("global persist ").removeprefix("global "))
+        # Older loaders also restore formerly persistent globals from saved settings.
+        for name, value in (persisted or {}).items():
+            if name in self.values and (legacy_restore or name in self.persistent_names):
+                self.values[name] = value
+
+    def saved_values(self):
+        return {name: self.values[name] for name in self.persistent_names}
 
     def evaluate(self, expression):
         expression = expression.replace("||", " or ").replace("&&", " and ")
@@ -422,6 +432,91 @@ class ModCyclerTests(unittest.TestCase):
         ini.time = 1
         ini.run("Present")
         self.assertEqual(ini.values["$last_cycle"], 1)
+
+    def test_auto_modes_start_off_with_restored_settings(self):
+        self.add_group(7, ["A", "B", "C"], [2, 5, 9], ["A", "B", "C"])
+        self.app.refresh_groups()
+        for favorites in (False, True):
+            gid, slot = (7, 5) if favorites else (1, 2)
+            self.select_only(gid)
+            self.app.favorite_only_var.set(favorites)
+            text = self.generate()
+            for legacy_restore in (False, True):
+                for auto, shuffle in ((1, 0), (0, 1), (1, 1)):
+                    with self.subTest(favorites=favorites, legacy_restore=legacy_restore,
+                                      auto=auto, shuffle=shuffle):
+                        ini = IniRunner(text, persisted={
+                            "$auto_enable": auto, "$shuffle_auto_enable": shuffle,
+                            "$last_cycle": 5000, f"$g{gid}_slot": slot,
+                        }, legacy_restore=legacy_restore)
+                        managed_slot = rf"$\modmanageragl\group_{gid}\active_slot"
+                        ini.values[managed_slot] = slot
+                        for timestamp in (0, 1, 120, 240, 10000):
+                            ini.time = timestamp
+                            ini.run("Present")
+                            self.assertEqual(ini.values["$auto_enable"], 0)
+                            self.assertEqual(ini.values["$shuffle_auto_enable"], 0)
+                            self.assertEqual(ini.values[f"$g{gid}_slot"], slot)
+                            self.assertEqual(ini.values[managed_slot], slot)
+                        self.assertNotIn("$auto_enable", ini.saved_values())
+                        self.assertNotIn("$shuffle_auto_enable", ini.saved_values())
+                        self.assertNotIn("$last_cycle", ini.saved_values())
+
+    def test_auto_modes_stop_after_reload_and_restart(self):
+        self.select_only(1)
+        text = self.generate()
+        for section in ("CommandListToggleAuto", "CommandListToggleShuffleAuto"):
+            with self.subTest(section=section):
+                ini = IniRunner(text)
+                ini.run("Present")
+                ini.time = 10
+                ini.run(section)
+                start_slot = ini.values["$g1_slot"]
+                ini.time = 130
+                ini.run("Present")
+                self.assertNotEqual(ini.values["$g1_slot"], start_slot)
+                saved = ini.saved_values()
+                for reload_time in (130, 0):
+                    with self.subTest(reload_time=reload_time):
+                        loaded = IniRunner(text, persisted=saved)
+                        loaded.time = reload_time
+                        loaded.run("Present")
+                        self.assertEqual(loaded.values["$auto_enable"], 0)
+                        self.assertEqual(loaded.values["$shuffle_auto_enable"], 0)
+                        self.assertEqual(loaded.values["$g1_slot"], saved["$g1_slot"])
+                        loaded.time += 240
+                        loaded.run("Present")
+                        self.assertEqual(loaded.values["$g1_slot"], saved["$g1_slot"])
+                        loaded.run("CommandListNext")
+                        self.assertNotEqual(loaded.values["$g1_slot"], saved["$g1_slot"])
+                        loaded.run("CommandListPrev")
+                        self.assertEqual(loaded.values["$g1_slot"], saved["$g1_slot"])
+                        loaded.run(section)
+                        self.assertEqual(loaded.values["$auto_enable"] +
+                                         loaded.values["$shuffle_auto_enable"], 1)
+
+    def test_first_auto_key_after_legacy_restore_enables_requested_mode(self):
+        self.select_only(1)
+        text = self.generate()
+        for section, auto, shuffle in (
+            ("CommandListToggleAuto", 1, 0), ("CommandListToggleShuffleAuto", 0, 1),
+        ):
+            with self.subTest(section=section):
+                ini = IniRunner(text, persisted={
+                    "$auto_enable": 1, "$shuffle_auto_enable": 1, "$last_cycle": 5000,
+                }, legacy_restore=True)
+                ini.time = 3
+                ini.run(section)
+                self.assertEqual(ini.values["$auto_enable"], auto)
+                self.assertEqual(ini.values["$shuffle_auto_enable"], shuffle)
+                initial_slot = ini.values["$g1_slot"]
+                ini.run("Present")
+                self.assertEqual(ini.values["$auto_enable"], auto)
+                self.assertEqual(ini.values["$shuffle_auto_enable"], shuffle)
+                self.assertEqual(ini.values["$g1_slot"], initial_slot)
+                ini.time = 123
+                ini.run("Present")
+                self.assertNotEqual(ini.values["$g1_slot"], initial_slot)
 
     def test_regeneration_recovers_after_group_shrinks(self):
         removed_names = ["D", "E", "F", "G", "H"]
